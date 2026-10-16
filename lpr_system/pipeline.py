@@ -1,16 +1,12 @@
 """
-pipeline.py — 번호판 인식 파이프라인 (병합본)
+pipeline.py — 번호판 인식 파이프라인
 
-사용자 추가:
-  - Levenshtein 편집거리 기반 fuzzy 중복 제거
-  - 신뢰도 기반 교체 저장 (더 좋은 인식 결과로 갱신)
-
-자동화 추가:
-  - 투표(Voting) 버퍼 — 7프레임 모아 최다 득표 텍스트 확정
-  - COOLDOWN_SEC 30초
-  - 스트림 자동 재연결
-  - on_progress 예외 처리
-  - None 프레임 가드
+  - 화이트리스트 교정: 같은 길이·편집거리 1·후보 1개일 때만 등록 번호로 교정
+  - 한글 검사: 번호판 용도 기호(PLATE_HANGUL)에 없는 한글이 나오면 결과를 버림
+  - 중복 제거: COOLDOWN_SEC(120초) 안에 편집거리 FUZZY_DIST(2) 이하 번호는 같은 차량으로 보고
+    첫 기록만 유지
+  - 투표 버퍼: VOTE_FRAMES 프레임을 모아 최다 득표 번호 확정 (현재 1 = 첫 인식 즉시 확정)
+  - 스트림 자동 재연결, on_progress 예외 처리, None 프레임 가드
 """
 
 import os
@@ -263,6 +259,27 @@ def _snap_to_whitelist(plate_text: str, conn) -> str:
     return plate_text
 
 
+# ══════════════════════════════════════════════════════════════
+#  번호판 한글 검사
+#  번호판 용도 기호로 쓰지 않는 한글('시', '리' 등)이 나오면 오인식으로 보고 버린다.
+#  영상 모드는 같은 추적 ID를 0.5초 뒤 다시 읽고, 카메라 모드는 다음 프레임에서 다시 읽는다.
+#  실험 결과: 오답 12건 중 10건 제외, 정답 제외 0건
+#  (experiments/detector_ocr_check)
+# ══════════════════════════════════════════════════════════════
+PLATE_HANGUL = frozenset(
+    "가나다라마거너더러머버서어저고노도로모보소오조구누두루무부수우주"  # 비사업용
+    "바사아자배"                                                        # 사업용·택배
+    "하허호"                                                            # 렌터카
+)
+
+
+def _valid_plate_hangul(plate_text: str, conn) -> bool:
+    """번호의 한글이 용도 기호 목록에 있거나, 등록차량 번호와 정확히 같으면 True."""
+    if all(ch in PLATE_HANGUL for ch in plate_text if not ch.isdigit()):
+        return True
+    return plate_text in _get_whitelist_cached(conn)
+
+
 # {키: {"time": datetime, "conf": float}}
 _last_seen: dict[str, dict] = {}
 _ls_lock   = threading.Lock()
@@ -338,7 +355,7 @@ def process_frame(
     try:
         # ── 게이트 모드: 가장 큰(가까운) 번호판 위주로 처리 ──────────
         #   입구 카메라는 대상 차가 화면에서 제일 크게 잡힌다. 배경에 주차된
-        #   다른 차들은 작게 잡히므로, 최대 박스의 50% 미만 크기는 버려서
+        #   다른 차들은 작게 잡히므로, 최대 박스의 30% 미만 크기는 버려서
         #   배경 차 오인식을 제거한다. (고정 크기 문턱이 아니라 프레임 내
         #   상대 크기라 멀리서 오는 흰판 recall은 유지)
         cands = detect_plate_candidates(frame)
@@ -361,6 +378,11 @@ def process_frame(
 
             # ── 등록차량 스냅 보정 (225→25, 루→로 등 OCR 오독 교정) ──
             plate_text = _snap_to_whitelist(plate_text, conn)
+
+            # ── 번호판에 쓰지 않는 한글이면 버림 ──────────────────
+            if not _valid_plate_hangul(plate_text, conn):
+                logger.debug(f"[{camera_id}] 한글 검사 제외: '{plate_text}'")
+                continue
 
             # ── 투표 버퍼 ──────────────────────────────────────
             confirmed = vbuf.feed(bbox, plate_text, confidence, plate_roi)
@@ -477,6 +499,9 @@ def process_tracked_roi(
             return None
 
         plate_text = _snap_to_whitelist(plate_text, conn)
+        if not _valid_plate_hangul(plate_text, conn):
+            logger.debug(f"[{camera_id}] 한글 검사 제외: '{plate_text}'")
+            return None
 
         confirmed = vbuf.feed(bbox, plate_text, confidence, plate_roi)
         if confirmed is None:

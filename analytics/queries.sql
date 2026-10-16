@@ -73,7 +73,7 @@ GROUP BY hour
 ORDER BY hour;
 
 
--- ── 4. 요일별 평균 매출 / 방문대수 (평일 vs 주말) ─────────────
+-- ── 4. 요일별 방문대수 / 평균 체류시간 (평일 vs 주말) ─────────
 WITH paired AS (
     SELECT plate_text, event_type, timestamp,
            LAG(timestamp)  OVER (PARTITION BY plate_text ORDER BY timestamp) AS prev_ts,

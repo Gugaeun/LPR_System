@@ -1,192 +1,87 @@
-# 한국 번호판 인식 시스템
+# lpr_system — 데스크톱 앱과 인식 모듈
 
-OpenCV + EasyOCR + SQLite 기반 한국 번호판 인식 파이프라인
-
----
-
-## 지원 번호판
-
-| 종류 | 배경색 | 예시 |
-|------|--------|------|
-| **신형 (NEW)** | 흰색 | `123가4567` |
-| **구형 (OLD)** | 녹색 | `서울 12 나 3456` |
-| 신형 사업용 | 흰색 + 노란 줄 | `123가4567` |
-| 신형 외교 | 파란색 | `외교 1234` |
+번호판 검출(YOLOv11m)·추적(ByteTrack)·인식(PaddleOCR)·기록(SQLite)을 담당하는 PyQt6 앱.
+프로젝트 전체 설명과 검증 결과는 [저장소 README](../README.md)를 참고한다.
 
 ---
 
-## 파일 구조
+## 파일 구성
 
-```
-lpr_system/
-├── database.py      — SQLite DB 연결 · CRUD · 화이트리스트
-├── detector.py      — 번호판 검출 · 색상 분류 · 전처리
-├── ocr_engine.py    — EasyOCR 래퍼 · 정규식 검증
-├── pipeline.py      — 전체 파이프라인 (영상 처리 진입점)
-├── query_tool.py    — CLI 조회 · 화이트리스트 관리
-├── demo.py          — EasyOCR 없이 동작을 확인하는 데모
-├── requirements.txt — 의존 패키지 목록
-├── samples/         — 테스트용 영상 파일 보관 위치
-├── plate_images/    — 인식된 번호판 이미지 자동 저장
-└── logs/            — 날짜별 시스템 로그
-```
+| 파일 | 역할 |
+|---|---|
+| `app_pyqt6.py` | PyQt6 앱. 영상 파일 처리, 카메라 관리, 조회·통계·요금·내보내기 화면 |
+| `detector.py` | YOLO 검출·추적, 폴백 검출(이진화·윤곽선·색상), 번호판 색 분류, OCR 전처리 |
+| `ocr_engine.py` | PaddleOCR 래퍼, 신뢰도 기준 적용, 정규식 번호 추출 |
+| `pipeline.py` | 화이트리스트 교정, 중복 제거, DB 기록, 카메라 스트림 처리 |
+| `database.py` | SQLite 스키마 생성, 기록·조회 함수 |
+| `parking_fee.py` | 입·출차 시각 기반 요금 계산 |
+| `excel_export.py` | 기간별 기록 엑셀 내보내기 |
+| `query_tool.py` | DB 조회·차량 관리 명령줄 도구 |
+| `load_demo_data.py` | `analytics/demo_parking.db`의 데모 데이터를 앱 DB(`parking.db`)로 복사 |
+| `clear_db.py`, `clear_db.bat` | 인식 기록·입출차 기록 삭제 |
+| `demo.py` | 합성 번호판 이미지로 색 분류·전처리·DB 저장 확인 (OCR 미사용) |
+| `models/plate_yolo11m.pt` | 학습한 번호판 검출 모델 |
 
----
-
-## 설치
-
-```bash
-pip install -r requirements.txt
-```
-
-> GPU 가속이 필요하면 `requirements.txt` 안의 torch 줄을 CUDA 버전으로 교체하세요.
+실행 중 생성되는 `parking.db`, `plate_images/`(인식한 번호판 이미지), `logs/`, `exports/`는 `.gitignore`로 제외했다.
 
 ---
 
 ## 실행
 
-### 1) 데모 (EasyOCR 없이 동작 확인)
-
 ```bash
-cd lpr_system
-python demo.py
+pip install -r requirements.txt
+python app_pyqt6.py
 ```
 
-합성 번호판 이미지를 생성해 DB 저장·조회 전 과정을 확인합니다.
+앱 화면: 대시보드, 번호판 검색, 등록차량, 블랙리스트, 카메라, 영상파일, 설정관리, 통계, 엑셀내보내기, 요금계산
 
-### 2) 영상 파일 처리
-
-```bash
-python pipeline.py samples/parking.mp4
-python pipeline.py samples/parking.mp4 --camera CAM_01 --gpu --show
-```
-
-| 옵션 | 설명 |
-|------|------|
-| `--camera` | 카메라 ID (기본: CAM_01) |
-| `--gpu` | EasyOCR GPU 가속 |
-| `--show` | 결과 창 표시 (헤드리스 서버에서는 사용 X) |
-
-### 3) 폴더 일괄 처리
+### 명령줄 조회 (`query_tool.py`)
 
 ```bash
-python pipeline.py samples/
-```
-
-### 4) DB 조회 / 관리
-
-```bash
-# 최근 100건 조회
-python query_tool.py all
-
-# 특정 번호판 이력 조회
-python query_tool.py plate 123가4567
-
-# 날짜별 조회
-python query_tool.py date 2025-06-07
-
-# 통계 (타입·색상별)
-python query_tool.py stats
-
-# 화이트리스트 등록
-python query_tool.py add 123가4567 홍길동 "검정 소나타"
-
-# 90일 이전 기록 자동 삭제
-python query_tool.py purge 90
+python query_tool.py all                      # 최근 100건 조회
+python query_tool.py plate 123가4567          # 번호 검색 (부분 일치)
+python query_tool.py date 2026-09-01          # 날짜별 조회
+python query_tool.py stats                    # 색상·종류별 통계
+python query_tool.py add 123가4567 홍길동 "검정 소나타"   # 화이트리스트 등록
+python query_tool.py block 999다8888 "도주 차량"         # 블랙리스트 등록
+python query_tool.py unblock 999다8888        # 블랙리스트 해제
+python query_tool.py blocklist                # 블랙리스트 전체 조회
+python query_tool.py purge 90                 # 90일 이전 기록 삭제
 ```
 
 ---
 
-## 주요 파라미터 조정
+## 주요 설정값
 
-### pipeline.py
-
-| 상수 | 기본값 | 설명 |
-|------|--------|------|
-| `PROCESS_EVERY_N` | 5 | N 프레임마다 1회 처리 (높을수록 빠름) |
-| `COOLDOWN_SEC` | 10 | 동일 번호판 재저장 방지 간격 (초) |
-| `SAVE_IMAGES` | True | 번호판 이미지 파일 저장 여부 |
-
-### detector.py
-
-| 상수 | 기본값 | 설명 |
-|------|--------|------|
-| `MIN_AREA` / `MAX_AREA` | 800 / 40000 | Contour 면적 필터 |
-| `MIN_ASPECT` / `MAX_ASPECT` | 1.8 / 6.5 | 가로:세로 비율 필터 |
-| `NORM_WIDTH` / `NORM_HEIGHT` | 320 / 80 | OCR 정규화 크기 |
-
-### ocr_engine.py
-
-| 상수 | 기본값 | 설명 |
-|------|--------|------|
-| `CONFIDENCE_THRESHOLD` | 0.55 | OCR 신뢰도 최소값 |
+| 파일 | 상수 | 값 | 의미 |
+|---|---|---|---|
+| `detector.py` | `_YOLO_CONF` | 0.07 | YOLO 검출 신뢰도 기준 |
+| `detector.py` | `MIN_AREA` / `MAX_AREA` | 700 / 45000 | 폴백 검출 윤곽선 면적 범위 |
+| `detector.py` | `MIN_ASPECT` / `MAX_ASPECT` | 1.1 / 9.0 | 폴백 검출 가로:세로 비율 범위 |
+| `ocr_engine.py` | `CONFIDENCE_THRESHOLD` | 0.20 | OCR 결과 신뢰도 기준 (일반) |
+| `ocr_engine.py` | `CONFIDENCE_THRESHOLD_OLD` | 0.15 | OCR 결과 신뢰도 기준 (녹색 구형) |
+| `pipeline.py` | `SNAP_DIST` | 1 | 화이트리스트 교정 편집거리 (같은 길이, 후보 1개일 때만) |
+| `pipeline.py` | `PLATE_HANGUL` | 40자 | 번호판 용도 기호. 이 밖의 한글이 나오면 결과를 버림 (등록 차량 번호와 같으면 통과) |
+| `pipeline.py` | `COOLDOWN_SEC` | 120 | 같은 차량으로 보는 시간 범위(초) |
+| `pipeline.py` | `FUZZY_DIST` | 2 | 같은 차량으로 보는 편집거리 |
+| `pipeline.py` | `VOTE_FRAMES` | 1 | 번호 확정에 필요한 프레임 수 (1 = 첫 인식 즉시 확정) |
+| `pipeline.py` | `PROCESS_EVERY_N` | 1 | 카메라 모드 처리 간격(프레임) |
 
 ---
 
-## DB 스키마
+## 처리 흐름
 
-### plate_logs
+**영상 파일 모드** (`app_pyqt6.py` VideoWorker)
 
-| 컬럼 | 타입 | 설명 |
-|------|------|------|
-| id | INTEGER PK | 자동 증가 |
-| plate_text | TEXT | 번호판 텍스트 |
-| plate_color | TEXT | WHITE / GREENYELLOW / YELLOW / BLUE |
-| plate_type | TEXT | NEW(신형) / OLD(구형) |
-| confidence | REAL | OCR 신뢰도 (0~1) |
-| timestamp | TEXT | 인식 시각 |
-| camera_id | TEXT | 카메라 ID |
-| image_path | TEXT | 저장된 이미지 경로 |
-| frame_number | INTEGER | 영상 프레임 번호 |
-| source_file | TEXT | 원본 영상 파일명 |
+1. 매 프레임 `detector.track_plates`로 번호판 위치와 추적 ID 갱신
+2. 번호가 확정되지 않은 추적 ID 중 가장 큰 번호판을 OCR 작업 스레드로 전달 (같은 ID 재시도 간격 0.5초)
+3. `pipeline.process_tracked_roi`: 색 분류, OCR, 화이트리스트 교정, 한글 검사, 중복 제거, DB 기록
+4. 블랙리스트 차량이면 경보 팝업
 
-### whitelist
+**카메라 모드** (`pipeline.process_stream`)
 
-| 컬럼 | 타입 | 설명 |
-|------|------|------|
-| id | INTEGER PK | |
-| plate_text | TEXT UNIQUE | 등록 번호판 |
-| owner_name | TEXT | 차량 소유자 |
-| vehicle_desc | TEXT | 차량 설명 |
-| registered_at | TEXT | 등록 일시 |
+1. 프레임마다 `detect_plate_candidates` 실행 (YOLO 결과가 없거나 녹색 번호판 색이 보이면 폴백 검출 추가)
+2. `process_frame`: 크기 필터, 색 분류, OCR, 화이트리스트 교정, 한글 검사, 중복 제거, DB 기록
+3. 연결이 끊기면 5초 간격으로 재연결
 
----
-
-## 파이프라인 전체 흐름
-
-```
-영상 파일
-   │
-   ▼
-프레임 추출 (N프레임마다)
-   │
-   ▼
-모션 감지 (BackgroundSubtractor)
-   │ 움직임 있을 때만
-   ▼
-번호판 후보 검출
-   CLAHE → GaussianBlur → Otsu 이진화
-   → Morphology → Contour → 면적·비율 필터
-   │
-   ▼
-색상 분류 (HSV)
-   WHITE(신형) / GREENYELLOW(구형)
-   │
-   ▼
-전처리
-   Perspective 보정 → 320×80 정규화
-   → CLAHE → Blur → 색상별 이진화 → Dilate
-   │
-   ▼
-EasyOCR 인식
-   신뢰도 필터링 → 정규식 검증
-   │
-   ▼
-중복 방지 (10초 쿨다운)
-   │
-   ▼
-SQLite DB 저장 + 이미지 파일 저장
-   │
-   ▼
-화이트리스트 대조 → 로그 출력
-```
+DB 테이블 구성은 [저장소 README 4장](../README.md#4-db-설계)에 정리했다.
