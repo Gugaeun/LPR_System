@@ -6,22 +6,21 @@
 
 -- ── 1. 입차·출차 페어링 (LAG 윈도우 함수) ────────────────────
 --    entry_exit_log은 ENTRY/EXIT이 각각 별도 행이라, 같은 번호판의
---    바로 다음 이벤트를 LAG로 끌어와 한 행(방문 1건)으로 재구성한다.
+--    직전 이벤트를 LAG로 가져와 한 행(방문 1건)으로 재구성한다.
 WITH paired AS (
-    SELECT
-        plate_text,
-        event_type,
-        timestamp,
-        LAG(timestamp)  OVER (PARTITION BY plate_text ORDER BY timestamp) AS prev_ts,
-        LAG(event_type) OVER (PARTITION BY plate_text ORDER BY timestamp) AS prev_type
+    SELECT plate_text, event_type, timestamp,
+           LAG(timestamp)  OVER (PARTITION BY plate_text
+                                 ORDER BY timestamp) AS prev_ts,
+           LAG(event_type) OVER (PARTITION BY plate_text
+                                 ORDER BY timestamp) AS prev_type
     FROM entry_exit_log
 ),
 visits AS (
-    SELECT
-        plate_text,
-        prev_ts                                   AS entry_time,
-        timestamp                                 AS exit_time,
-        (JULIANDAY(timestamp) - JULIANDAY(prev_ts)) * 24 * 60 AS duration_min
+    SELECT plate_text,
+           prev_ts   AS entry_time,
+           timestamp AS exit_time,
+           (JULIANDAY(timestamp) - JULIANDAY(prev_ts)) * 24 * 60
+                     AS duration_min
     FROM paired
     WHERE event_type = 'EXIT' AND prev_type = 'ENTRY'
 )

@@ -429,7 +429,8 @@ def process_frame(
             if direction == "BOTH":
                 # 마지막 이벤트가 ENTRY면 EXIT, 아니면(없거나 EXIT이면) ENTRY
                 last = conn.execute(
-                    "SELECT event_type FROM entry_exit_log WHERE plate_text=? ORDER BY id DESC LIMIT 1",
+                    "SELECT event_type FROM entry_exit_log "
+                    "WHERE plate_text=? ORDER BY id DESC LIMIT 1",
                     (final_text,)
                 ).fetchone()
                 event = "EXIT" if last and last[0] == "ENTRY" else "ENTRY"
@@ -542,7 +543,8 @@ def process_tracked_roi(
 
         if direction == "BOTH":
             last = conn.execute(
-                "SELECT event_type FROM entry_exit_log WHERE plate_text=? ORDER BY id DESC LIMIT 1",
+                "SELECT event_type FROM entry_exit_log "
+                "WHERE plate_text=? ORDER BY id DESC LIMIT 1",
                 (final_text,)
             ).fetchone()
             event = "EXIT" if last and last[0] == "ENTRY" else "ENTRY"

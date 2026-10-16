@@ -106,9 +106,9 @@ def mosaic_figure(img, name):
     pb = C.plate_box(img)
     cb = C.shifted(pb, img.shape[0])
     conds = [("원본 번호판", img, pb, "번호판"),
-             ("번호판만 모자이크", C.mosaic(img, pb), pb, "번호판 위치")]
+             ("번호판 모자이크", C.mosaic(img, pb), pb, "번호판 위치")]
     if cb:
-        conds.append(("차체 일부만 모자이크", C.mosaic(img, cb), cb, "모자이크 위치"))
+        conds.append(("차체 일부 모자이크", C.mosaic(img, cb), cb, "모자이크 위치"))
     vx0, vy0, vx1, vy1 = view_box(img, [pb] + ([cb] if cb else []))
     panels = []
     for title, im, target, what in conds:
@@ -136,8 +136,8 @@ fbox = (x + pb[0], y + pb[1], x + pb[2], y + pb[3])
 fcb = C.shifted(fbox, fr.shape[0])
 panels = []
 for title, im, target, what in (("원본 번호판", fr, fbox, "번호판"),
-                                ("번호판만 모자이크", C.mosaic(fr, fbox), fbox, "번호판 위치"),
-                                ("차체 일부만 모자이크", C.mosaic(fr, fcb), fcb, "모자이크 위치")):
+                                ("번호판 모자이크", C.mosaic(fr, fbox), fbox, "번호판 위치"),
+                                ("차체 일부 모자이크", C.mosaic(fr, fcb), fcb, "모자이크 위치")):
     boxes = C.yolo_boxes(im)
     text, color, hit = result_text(boxes, target, what)
     panels.append(panel(draw_boxes(hide_serials(im), hit), title, text, color, height=240))
