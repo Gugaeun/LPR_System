@@ -79,7 +79,12 @@ def read_plate(
         return "", 0.0
 
     # PaddleOCR은 자체 전처리가 강력하므로 원본 crop을 우선 사용.
-    img = raw_roi if (raw_roi is not None and raw_roi.size > 0) else processed_img
+    # 단, crop이 극단적으로 작으면(예: 먼 차량) 원본엔 글자 정보가 거의 없어
+    # PaddleOCR 자체 전처리로도 못 살리므로, 이 경우만 업스케일된 processed_img를 쓴다.
+    _MIN_RAW_H = 32
+    use_raw = (raw_roi is not None and raw_roi.size > 0
+              and raw_roi.shape[0] >= _MIN_RAW_H)
+    img = raw_roi if use_raw else processed_img
     if img is None or img.size == 0:
         return "", 0.0
 

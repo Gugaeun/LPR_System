@@ -82,6 +82,18 @@ def init_db() -> None:
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS overstay_log (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            plate_text   TEXT    NOT NULL,
+            camera_id    TEXT    DEFAULT '',
+            entry_time   TEXT    NOT NULL,
+            detected_at  TEXT    NOT NULL,
+            duration_min INTEGER DEFAULT 0,
+            image_path   TEXT    DEFAULT ''
+        )
+    """)
+
     for sql in [
         "CREATE INDEX IF NOT EXISTS idx_pl_plate ON plate_logs (plate_text)",
         "CREATE INDEX IF NOT EXISTS idx_pl_ts    ON plate_logs (timestamp)",
@@ -89,6 +101,8 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_ee_plate ON entry_exit_log (plate_text)",
         "CREATE INDEX IF NOT EXISTS idx_ee_ts    ON entry_exit_log (timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_ee_type  ON entry_exit_log (event_type)",
+        "CREATE INDEX IF NOT EXISTS idx_ov_plate ON overstay_log (plate_text)",
+        "CREATE INDEX IF NOT EXISTS idx_ov_entry ON overstay_log (entry_time)",
     ]:
         c.execute(sql)
 
@@ -518,3 +532,67 @@ def query_parking_duration(conn, plate_text: str):
         LIMIT 20
     """, (plate_text,))
     return c.fetchall()
+
+
+# ── 불법 주정차(장시간 체류) 감지 ──────────────────────────────
+
+def query_overstay(conn, threshold_minutes: int = 60):
+    """
+    현재 주차 중(ENTRY만 있고 EXIT 없음)인 차량 중 화이트리스트에
+    등록되지 않은 차량이 threshold_minutes 이상 연속 체류 중이면
+    불법 주정차 의심으로 반환한다.
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT * FROM (
+            SELECT e.plate_text,
+                   e.timestamp AS entry_time,
+                   e.camera_id,
+                   CAST(
+                     (julianday('now','localtime') - julianday(e.timestamp)) * 24 * 60
+                   AS INTEGER) AS duration_min
+            FROM entry_exit_log e
+            JOIN (
+                SELECT plate_text, MAX(id) AS max_id
+                FROM entry_exit_log
+                GROUP BY plate_text
+            ) latest ON e.id = latest.max_id
+            LEFT JOIN whitelist w ON e.plate_text = w.plate_text
+            WHERE e.event_type = 'ENTRY'
+              AND w.plate_text IS NULL
+        )
+        WHERE duration_min >= ?
+        ORDER BY duration_min DESC
+    """, (threshold_minutes,))
+    return c.fetchall()
+
+
+def has_overstay_log(conn, plate_text: str, entry_time: str) -> bool:
+    """같은 입차 세션(plate_text + entry_time)에 대해 이미 기록했는지 확인(중복 방지)."""
+    return conn.execute(
+        "SELECT 1 FROM overstay_log WHERE plate_text=? AND entry_time=?",
+        (plate_text, entry_time)
+    ).fetchone() is not None
+
+
+def insert_overstay_log(conn, plate_text, camera_id, entry_time,
+                        duration_min, image_path="") -> int:
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO overstay_log
+              (plate_text, camera_id, entry_time, detected_at, duration_min, image_path)
+            VALUES (?,?,?,?,?,?)
+        """, (plate_text, camera_id, entry_time,
+              datetime.now().strftime("%Y-%m-%d %H:%M:%S"), duration_min, image_path))
+        conn.commit()
+        return c.lastrowid
+    except sqlite3.Error:
+        conn.rollback()
+        return -1
+
+
+def get_all_overstay(conn, limit=100):
+    return conn.execute(
+        "SELECT * FROM overstay_log ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()

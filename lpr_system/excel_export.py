@@ -3,6 +3,7 @@ excel_export.py — 기간별 기록 엑셀 내보내기
 """
 
 import os
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -12,6 +13,26 @@ from openpyxl.styles import (
 )
 
 EXPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports")
+
+
+# ── 개인정보 마스킹 ──────────────────────────────────────────────
+# 외부 공유/공개용 내보내기 시 번호판·연락처 등 개인정보를 가림 처리한다.
+
+def mask_plate(plate_text: str) -> str:
+    """번호판 끝 2자리를 ** 로 가림. 예: 12가3456 -> 12가34**"""
+    if not plate_text or len(plate_text) < 3:
+        return plate_text
+    return plate_text[:-2] + "**"
+
+
+def mask_phone(phone: str) -> str:
+    """연락처 가운데 자리를 가림. 예: 010-1234-5678 -> 010-****-5678"""
+    if not phone:
+        return phone
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) < 9:
+        return phone
+    return f"{digits[:3]}-****-{digits[-4:]}"
 
 
 def _header_style():
@@ -30,9 +51,11 @@ def _apply(cell, styles: dict):
         setattr(cell, k, v)
 
 
-def export_plate_logs(rows, start_date: str, end_date: str) -> str:
+def export_plate_logs(rows, start_date: str, end_date: str,
+                      mask_personal: bool = False) -> str:
     """
     plate_logs → xlsx 파일 저장.
+    mask_personal=True면 번호판을 가림 처리(mask_plate)해 외부 공유용으로 내보낸다.
     반환: 저장된 파일 경로
     """
     os.makedirs(EXPORT_DIR, exist_ok=True)
@@ -65,9 +88,12 @@ def export_plate_logs(rows, start_date: str, end_date: str) -> str:
     for i, r in enumerate(rows, 2):
         r = dict(r)
         status = "차단" if r.get("is_black") else ("등록" if r.get("is_white") else "미등록")
+        plate_text = r.get("plate_text")
+        if mask_personal:
+            plate_text = mask_plate(plate_text)
         row_data = [
             r.get("id"),
-            r.get("plate_text"),
+            plate_text,
             r.get("plate_color"),
             "신형" if r.get("plate_type") == "NEW" else "구형",
             f"{float(r.get('confidence', 0)):.1%}",
@@ -88,9 +114,11 @@ def export_plate_logs(rows, start_date: str, end_date: str) -> str:
     return path
 
 
-def export_entry_exit(rows, start_date: str, end_date: str) -> str:
+def export_entry_exit(rows, start_date: str, end_date: str,
+                      mask_personal: bool = False) -> str:
     """
     entry_exit_log → xlsx 파일 저장.
+    mask_personal=True면 번호판·연락처를 가림 처리해 외부 공유용으로 내보낸다.
     반환: 저장된 파일 경로
     """
     os.makedirs(EXPORT_DIR, exist_ok=True)
@@ -122,15 +150,21 @@ def export_entry_exit(rows, start_date: str, end_date: str) -> str:
     for i, r in enumerate(rows, 2):
         r = dict(r)
         is_entry = r.get("event_type") == "ENTRY"
+        plate_text = r.get("plate_text")
+        phone      = r.get("phone") or "-"
+        if mask_personal:
+            plate_text = mask_plate(plate_text)
+            if phone != "-":
+                phone = mask_phone(phone)
         row_data = [
             r.get("id"),
-            r.get("plate_text"),
+            plate_text,
             "입차" if is_entry else "출차",
             r.get("camera_id"),
             r.get("timestamp"),
             r.get("owner_name") or "-",
             r.get("vehicle_desc") or "-",
-            r.get("phone") or "-",
+            phone,
         ]
         fill = fill_entry if is_entry else fill_exit
         for col, val in enumerate(row_data, 1):

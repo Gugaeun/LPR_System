@@ -32,12 +32,16 @@ from database import (
     delete_plate_log,
     delete_entry_exit_by_text, manual_exit, get_session_times,
     is_whitelisted,
+    query_overstay, has_overstay_log, insert_overstay_log, get_all_overstay,
 )
 from pipeline import process_frame as _pf, _release_vote_buffer, start_camera_thread
 import pipeline as pl
 from ocr_engine import init_reader, is_gpu_available, reinit_reader
 from excel_export import export_plate_logs, export_entry_exit
 from parking_fee import calc_fee, FEE_CONFIG
+
+# 불법 주정차 감지 기준 — 미등록(비회원) 차량이 이 시간(분) 이상 연속 체류하면 의심 등록
+OVERSTAY_THRESHOLD_MIN = 60
 
 # ── 색상 팔레트 ─────────────────────────────────────────────────────────────────────
 C_BG      = "#F1F5F9"
@@ -75,18 +79,18 @@ QFrame#InfoBanner {{
     border: none;
     border-radius: 8px;
 }}
-QLabel {{ color: {C_TEXT}; font-size: 16px; }}
+QLabel {{ color: {C_TEXT}; font-size: 19px; }}
 QLabel#HeaderTitle {{ font-size: 30px; font-weight: bold; color: {C_TEXT}; }}
-QLabel#SectionTitle {{ font-size: 24px; font-weight: bold; color: {C_TEXT}; }}
-QLabel#Muted {{ color: {C_MUTED}; font-size: 15px; }}
-QLabel#ColHeader {{ color: {C_MUTED}; font-size: 14px; font-weight: bold; }}
+QLabel#SectionTitle {{ font-size: 25px; font-weight: bold; color: {C_TEXT}; }}
+QLabel#Muted {{ color: {C_MUTED}; font-size: 19px; }}
+QLabel#ColHeader {{ color: {C_MUTED}; font-size: 19px; font-weight: bold; }}
 QLabel#StatValue {{ font-size: 38px; font-weight: bold; color: {C_TEXT}; }}
 QLabel#FeeAmount {{ font-size: 32px; font-weight: bold; }}
 QPushButton {{
     border-radius: 6px;
     padding: 8px 16px;
     font-weight: bold;
-    font-size: 15px;
+    font-size: 19px;
     border: none;
 }}
 QPushButton#Primary {{ background-color: {C_ACCENT}; color: white; }}
@@ -117,7 +121,7 @@ QLineEdit, QComboBox {{
     border-radius: 6px;
     background-color: {C_BG};
     color: {C_TEXT};
-    font-size: 15px;
+    font-size: 19px;
 }}
 QLineEdit:focus, QComboBox:focus {{
     background-color: #E8F0FE;
@@ -139,14 +143,14 @@ QTableWidget {{
     background-color: {C_SURFACE};
     gridline-color: {C_BG};
     selection-background-color: {C_ACCENT}22;
-    font-size: 15px;
+    font-size: 19px;
 }}
 QHeaderView::section {{
     background-color: #0F2444;
     color: #CBD5E1;
     border: none;
     font-weight: bold;
-    font-size: 15px;
+    font-size: 19px;
     padding: 10px 14px;
 }}
 QTableWidget::item {{ padding: 10px 14px; color: {C_TEXT}; }}
@@ -162,7 +166,7 @@ QProgressBar::chunk {{
     background-color: {C_ACCENT};
     border-radius: 4px;
 }}
-QCheckBox {{ color: {C_TEXT}; font-size: 15px; spacing: 8px; }}
+QCheckBox {{ color: {C_TEXT}; font-size: 19px; spacing: 8px; }}
 QCheckBox::indicator {{
     width: 18px; height: 18px; border-radius: 4px; border: none;
     background-color: {C_BG};
@@ -170,7 +174,7 @@ QCheckBox::indicator {{
 QCheckBox::indicator:checked {{
     background-color: {C_ACCENT};
 }}
-QStatusBar {{ background-color: {C_SURFACE}; border: none; font-size: 14px; }}
+QStatusBar {{ background-color: {C_SURFACE}; border: none; font-size: 19px; }}
 QFrame#Sidebar {{
     background-color: {C_SIDEBAR};
     border: none;
@@ -180,9 +184,9 @@ QToolButton {{
     color: #475569;
     border: none;
     border-radius: 8px;
-    font-size: 13px;
+    font-size: 18px;
     padding: 6px 0px;
-    qproperty-toolButtonStyle: ToolButtonTextUnderIcon;
+    qproperty-toolButtonStyle: ToolButtonTextBesideIcon;
 }}
 QToolButton:hover {{
     background-color: rgba(255,255,255,0.10);
@@ -201,7 +205,8 @@ def _get_kr_font(size: int):
     try:
         from PIL import ImageFont
         candidates = [
-            os.path.join(os.path.dirname(__file__), "assets", "fonts", "MyFont.ttf"),
+            os.path.join(os.path.dirname(__file__), "assets", "fonts", "Pretendard-Bold.otf"),
+            "C:/Windows/Fonts/Pretendard-Bold.otf",
             "C:/Windows/Fonts/malgun.ttf",
             "C:/Windows/Fonts/gulim.ttc",
             "C:/Windows/Fonts/batang.ttc",
@@ -290,12 +295,17 @@ def clear_layout(layout):
         elif item.layout():
             clear_layout(item.layout())
 
+_TAG_WIDTH  = 84   # 미등록/등록/차단/입차/출차/신형/구형 등 모든 뱃지·태그 공통 폭
+                   # (텍스트 글자 수와 무관하게 같은 크기로 보이도록 고정)
+_TAG_HEIGHT = 36   # "삭제"/"중지"/"시작" 등 옆에 나란히 오는 버튼과 높이를 맞춤
+
 def make_tag(text, color):
     lbl = QLabel(text)
     lbl.setStyleSheet(
         f"background-color: {color}; color: white; border-radius: 4px; "
-        f"padding: 3px 10px; font-weight: bold; font-size: 11px;"
+        f"font-weight: bold; font-size: 18px;"
     )
+    lbl.setFixedSize(_TAG_WIDTH, _TAG_HEIGHT)
     lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
     return lbl
 
@@ -303,9 +313,66 @@ def make_badge(text, color):
     lbl = QLabel(text)
     lbl.setStyleSheet(
         f"background-color: {color}; color: white; border-radius: 4px; "
-        f"padding: 2px 7px; font-size: 10px; font-weight: bold;"
+        f"font-size: 18px; font-weight: bold;"
     )
+    lbl.setFixedSize(_TAG_WIDTH, _TAG_HEIGHT)
+    lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
     return lbl
+
+# ── 사이드바 네비 버튼 (아이콘 좌측 고정 + 텍스트 우측, 수동 레이아웃) ──────────
+# QToolButton의 BesideIcon 스타일은 Qt 스타일시트와 결합하면 아이콘·텍스트가
+# 겹치거나 잘리는 문제가 있어, 직접 QHBoxLayout으로 배치해 안정적으로 제어한다.
+class NavButton(QFrame):
+    clicked = pyqtSignal()
+
+    def __init__(self, text, icon_name):
+        super().__init__()
+        self.icon_name = icon_name
+        self.setFixedSize(176, 56)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        lo = QHBoxLayout(self)
+        lo.setContentsMargins(14, 0, 10, 0)
+        lo.setSpacing(10)
+
+        self.icon_lbl = QLabel()
+        self.icon_lbl.setFixedSize(20, 20)
+        self.icon_lbl.setStyleSheet("background: transparent; border: none;")
+        lo.addWidget(self.icon_lbl)
+
+        self.text_lbl = QLabel(text)
+        self.text_lbl.setStyleSheet(
+            "background: transparent; border: none; font-size: 19px;"
+        )
+        lo.addWidget(self.text_lbl, 1)
+
+        self.set_active(False)
+
+    def set_active(self, active: bool):
+        color = "white" if active else "#475569"
+        self.icon_lbl.setPixmap(qta.icon(self.icon_name, color=color).pixmap(20, 20))
+        if active:
+            self.setStyleSheet(
+                "NavButton { background-color: #1D4ED8; border-radius: 8px; border: none; }"
+            )
+            self.text_lbl.setStyleSheet(
+                "background: transparent; border: none; font-size: 19px; "
+                "font-weight: bold; color: white;"
+            )
+        else:
+            self.setStyleSheet(
+                "NavButton { background-color: transparent; border-radius: 8px; border: none; } "
+                "NavButton:hover { background-color: rgba(0,0,0,0.06); }"
+            )
+            self.text_lbl.setStyleSheet(
+                "background: transparent; border: none; font-size: 19px; color: #475569;"
+            )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
 
 def col_header_row(*labels_widths):
     """(label, width_or_None) 튜플을 받아 컬럼 헤더 행 (QFrame) 반환"""
@@ -318,7 +385,7 @@ def col_header_row(*labels_widths):
     lo.setSpacing(10)
     for label, w in labels_widths:
         lbl = QLabel(label)
-        lbl.setStyleSheet("color: #CBD5E1; font-size: 13px; font-weight: bold;")
+        lbl.setStyleSheet("color: #CBD5E1; font-size: 18px; font-weight: bold;")
         if w:
             lbl.setFixedWidth(w)
         else:
@@ -366,25 +433,26 @@ class LogRow(QFrame):
             self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         lo = QHBoxLayout(self)
-        lo.setContentsMargins(0, 0, 14, 0)
+        lo.setContentsMargins(12, 8, 14, 8)
         lo.setSpacing(12)
 
-        # 왼쪽 컬러 막대
+        # 왼쪽 컬러 막대 (박스 안에 여백 두고 작게 — 둥근 모서리 밖으로 안 튀어나오게)
         bar = QFrame()
-        bar.setFixedSize(5, 56)
+        bar.setObjectName("AccentBar")
+        bar.setFixedWidth(6)
+        bar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         bar.setStyleSheet(
-            f"background-color: {accent_color}; border-top-left-radius: 10px; "
-            f"border-bottom-left-radius: 10px; border: none;"
+            f"QFrame#AccentBar {{ background-color: {accent_color}; border-radius: 3px; border: none; }}"
         )
         lo.addWidget(bar)
 
         # 번호판 (굵게, 크게)
         pl_lbl = QLabel(data.get("plate_text", ""))
         pl_lbl.setStyleSheet(
-            f"font-weight: bold; font-size: 15px; color: {C_TEXT}; "
+            f"font-weight: bold; font-size: 19px; color: {C_TEXT}; "
             f"border: none; background: transparent;"
         )
-        pl_lbl.setFixedWidth(120)
+        pl_lbl.setFixedWidth(136)
         lo.addWidget(pl_lbl)
 
         # 신형/구형 뱃지
@@ -395,8 +463,8 @@ class LogRow(QFrame):
 
         # 카메라 ID
         cam_lbl = QLabel(data.get("camera_id", ""))
-        cam_lbl.setFixedWidth(80)
-        cam_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 13px; border: none; background: transparent;")
+        cam_lbl.setFixedWidth(104)
+        cam_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 18px; border: none; background: transparent;")
         lo.addWidget(cam_lbl)
 
         # 신뢰도
@@ -405,13 +473,13 @@ class LogRow(QFrame):
         except Exception:
             conf_val = "-"
         conf_lbl = QLabel(conf_val)
-        conf_lbl.setFixedWidth(48)
-        conf_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 13px; border: none; background: transparent;")
+        conf_lbl.setFixedWidth(66)
+        conf_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 18px; border: none; background: transparent;")
         lo.addWidget(conf_lbl)
 
         # 타임스탬프
         ts_lbl = QLabel(data.get("timestamp", ""))
-        ts_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 13px; border: none; background: transparent;")
+        ts_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 18px; border: none; background: transparent;")
         lo.addWidget(ts_lbl, 1)
 
         # 입차 / 출차 시간 (data에 entry_time 키가 있을 때만)
@@ -420,10 +488,10 @@ class LogRow(QFrame):
             ein  = et[5:16] if et else "-:-"      # MM-DD HH:MM
             xout = xt[5:16] if xt else "-:-"
             in_lbl = QLabel(f"입차 {ein}")
-            in_lbl.setStyleSheet(f"color: {C_GREEN}; font-size: 13px; font-weight: bold; border: none; background: transparent;")
+            in_lbl.setStyleSheet(f"color: {C_GREEN}; font-size: 18px; font-weight: bold; border: none; background: transparent;")
             out_lbl = QLabel(f"출차 {xout}")
             out_lbl.setStyleSheet(
-                f"color: {C_RED if xt else C_MUTED}; font-size: 13px; font-weight: bold; "
+                f"color: {C_RED if xt else C_MUTED}; font-size: 18px; font-weight: bold; "
                 f"border: none; background: transparent;"
             )
             lo.addWidget(in_lbl); lo.addWidget(out_lbl)
@@ -441,10 +509,10 @@ class LogRow(QFrame):
         # 삭제 버튼
         if show_delete:
             btn = QPushButton("삭제")
-            btn.setFixedSize(54, 30)
+            btn.setFixedSize(84, 36)
             btn.setStyleSheet(
                 f"background-color: {C_RED}; color: white; border-radius: 6px; "
-                f"font-weight: bold; font-size: 12px; border: none;"
+                f"font-weight: bold; font-size: 17px; border: none;"
             )
             btn.clicked.connect(lambda: self.delete_clicked.emit(self.data))
             lo.addWidget(btn)
@@ -716,10 +784,10 @@ class MainWindow(QMainWindow):
         # 사이드바
         self.sidebar = QFrame()
         self.sidebar.setObjectName("Sidebar")
-        self.sidebar.setFixedWidth(100)
+        self.sidebar.setFixedWidth(188)
         self.sidebar_lo = QVBoxLayout(self.sidebar)
-        self.sidebar_lo.setContentsMargins(6, 12, 6, 12)
-        self.sidebar_lo.setSpacing(4)
+        self.sidebar_lo.setContentsMargins(6, 16, 6, 16)
+        self.sidebar_lo.setSpacing(10)
         self.sidebar_lo.setAlignment(Qt.AlignmentFlag.AlignTop)
         root.addWidget(self.sidebar)
 
@@ -772,7 +840,13 @@ class MainWindow(QMainWindow):
         timer.timeout.connect(self.update_time)
         timer.start(1000)
         self.update_time()
+
+        self.overstay_timer = QTimer(self)
+        self.overstay_timer.timeout.connect(self.check_overstay)
+        self.overstay_timer.start(60_000)   # 1분마다 불법 주정차(장시간 체류) 점검
+
         self.refresh_dashboard()
+        self.check_overstay()
 
     # ── 공통 헬퍼 ──────────────────────────────────────────────────────────────────
     def update_time(self):
@@ -835,19 +909,13 @@ class MainWindow(QMainWindow):
             ("영상파일",    "fa5s.file-video"),
             ("설정관리",    "fa5s.sliders-h"),
             ("통계",        "fa5s.chart-bar"),
-            ("엑셀내보기",  "fa5s.file-excel"),
+            ("엑셀내보내기", "fa5s.file-excel"),
             ("요금계산",    "fa5s.calculator"),
         ]
         self.nav_btns = []
         for i, (text, icon_name) in enumerate(menus):
-            btn = QToolButton()
-            btn.setText(text)
-            btn.setIcon(qta.icon(icon_name, color="#475569"))
-            btn.setIconSize(QSize(24, 24))
-            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-            btn.setFixedSize(88, 72)
-            btn.clicked.connect(lambda _, idx=i: self.switch_page(idx))
-            btn.setProperty("icon_name", icon_name)
+            btn = NavButton(text, icon_name)
+            btn.clicked.connect(lambda idx=i: self.switch_page(idx))
             self.sidebar_lo.addWidget(btn)
             self.nav_btns.append(btn)
         self.switch_page(0)
@@ -855,25 +923,7 @@ class MainWindow(QMainWindow):
     def switch_page(self, idx):
         self.stacked.setCurrentIndex(idx)
         for i, btn in enumerate(self.nav_btns):
-            icon_name = btn.property("icon_name")
-            if i == idx:
-                btn.setStyleSheet(
-                    "QToolButton {"
-                    "background-color: #1D4ED8; color: white; "
-                    "border-radius: 8px; font-weight: bold; font-size: 12px;"
-                    "padding: 6px 0px;"
-                    "}"
-                )
-                btn.setIcon(qta.icon(icon_name, color="white"))
-            else:
-                btn.setStyleSheet(
-                    "QToolButton {"
-                    "background-color: transparent; color: #94A3B8; "
-                    "border: none; font-size: 12px;"
-                    "padding: 6px 0px;"
-                    "}"
-                )
-                btn.setIcon(qta.icon(icon_name, color="#475569"))
+            btn.set_active(i == idx)
 
         refresh_map = {
             0: self.refresh_dashboard,
@@ -947,7 +997,8 @@ class MainWindow(QMainWindow):
         log_card = QFrame(); log_card.setObjectName("Card")
         log_lo = QVBoxLayout(log_card); log_lo.setContentsMargins(14, 12, 14, 12)
         log_lo.setSpacing(8)
-        lbl = QLabel("최근 인식 로그"); lbl.setObjectName("Muted")
+        lbl = QLabel("최근 인식 로그")
+        lbl.setStyleSheet(f"color: {C_TEXT}; font-size: 20px; font-weight: bold;")
         log_lo.addWidget(lbl)
         self.dash_scroll = QScrollArea(widgetResizable=True)
         self.dash_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
@@ -968,7 +1019,7 @@ class MainWindow(QMainWindow):
         park_card = QFrame(); park_card.setObjectName("Card")
         park_lo = QVBoxLayout(park_card); park_lo.setContentsMargins(14, 12, 14, 12)
         park_title = QLabel("주차 중인 차량")
-        park_title.setStyleSheet(f"color: {C_ACCENT}; font-weight: bold; font-size: 13px;")
+        park_title.setStyleSheet(f"color: {C_ACCENT}; font-weight: bold; font-size: 20px;")
         park_title.setContentsMargins(0, 0, 0, 4)
         park_lo.addWidget(park_title)
         self.dash_park_sa = QScrollArea(widgetResizable=True)
@@ -1010,7 +1061,7 @@ class MainWindow(QMainWindow):
 
         alert_hdr_title = QLabel("경보 알림")
         alert_hdr_title.setStyleSheet(
-            "color: white; font-weight: bold; font-size: 13px; "
+            "color: white; font-weight: bold; font-size: 20px; "
             "border: none; background: transparent;"
         )
         ah_lo.addWidget(alert_hdr_title)
@@ -1019,7 +1070,7 @@ class MainWindow(QMainWindow):
         self.dash_alert_count = QLabel("0")
         self.dash_alert_count.setStyleSheet(
             "background-color: white; color: #991B1B; border-radius: 9px; "
-            "padding: 0px 8px; font-size: 11px; font-weight: bold; border: none; min-width: 18px;"
+            "padding: 0px 8px; font-size: 16px; font-weight: bold; border: none; min-width: 18px;"
         )
         self.dash_alert_count.setFixedHeight(20)
         self.dash_alert_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1052,7 +1103,8 @@ class MainWindow(QMainWindow):
         icon_lbl = QLabel()
         icon_lbl.setPixmap(qta.icon(icon_name, color=icon_color).pixmap(22, 22))
         top_row.addWidget(icon_lbl)
-        title_lbl = QLabel(title); title_lbl.setObjectName("Muted")
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet(f"color: {C_TEXT}; font-size: 19px; font-weight: bold;")
         top_row.addWidget(title_lbl)
         top_row.addStretch()
         lo.addLayout(top_row)
@@ -1074,23 +1126,37 @@ class MainWindow(QMainWindow):
                 sum(1 for c in get_all_cameras(self.conn) if c["enabled"])
             ))
 
-            # 입출차 최신 상태 행(plate_text 로 최근 이벤트)
+            # 인식 로그 각 행(촬영 시각) 자체를 entry_exit_log와 "같은 시각"으로
+            # 정확히 매칭해 그 순간이 입차 촬영인지 출차 촬영인지 판별.
+            # (번호판의 "최종 상태"를 모든 행에 똑같이 바르면 입차 사진 행도
+            #  출차로 보이는 문제가 있었음 — 행별 매칭으로 수정)
             try:
                 ee_cur = self.conn.execute(
-                    "SELECT plate_text, event_type FROM entry_exit_log "
-                    "ORDER BY timestamp DESC LIMIT 300"
+                    "SELECT plate_text, event_type, timestamp FROM entry_exit_log "
+                    "ORDER BY id DESC LIMIT 1000"
                 )
-                ee_map: dict = {}
+                ee_exact: dict = {}
                 for _ee in ee_cur.fetchall():
-                    if _ee[0] not in ee_map:
-                        ee_map[_ee[0]] = _ee[1]
+                    ee_exact[(_ee[0], _ee[2])] = _ee[1]
             except Exception:
-                ee_map = {}
+                ee_exact = {}
 
             clear_layout(self.dash_vbox)
             for r in query_all(self.conn, limit=30):
                 d = dict(r)
-                d["event_type"] = ee_map.get(d.get("plate_text", ""), "")
+                plate_text = d.get("plate_text", "")
+                ts         = d.get("timestamp", "")
+                ev = ee_exact.get((plate_text, ts))
+                if ev is None:
+                    # 정확히 같은 초가 없으면 가장 가까운 시각의 입출차 이벤트로 보정
+                    nearest = self.conn.execute(
+                        "SELECT event_type FROM entry_exit_log WHERE plate_text=? "
+                        "ORDER BY ABS(strftime('%s', timestamp) - strftime('%s', ?)) ASC "
+                        "LIMIT 1",
+                        (plate_text, ts)
+                    ).fetchone()
+                    ev = nearest[0] if nearest else ""
+                d["event_type"] = ev
                 self.dash_vbox.addWidget(LogRow(d))
 
             clear_layout(self.dash_parked_vbox)
@@ -1109,7 +1175,7 @@ class MainWindow(QMainWindow):
                 rl.addWidget(icon_lbl)
                 pl_lbl = QLabel(d["plate_text"])
                 pl_lbl.setStyleSheet(f"font-weight: bold; color: {C_TEXT}; background: transparent; border: none;")
-                pl_lbl.setFixedWidth(110)
+                pl_lbl.setFixedWidth(122)
                 rl.addWidget(pl_lbl)
                 owner_lbl = QLabel(d.get("owner_name") or "-")
                 owner_lbl.setStyleSheet(f"color: {C_MUTED}; background: transparent; border: none;")
@@ -1117,7 +1183,7 @@ class MainWindow(QMainWindow):
                 time_lbl = QLabel(d.get("entry_time", "")[-8:])
                 time_lbl.setStyleSheet(f"color: {C_MUTED}; background: transparent; border: none;")
                 rl.addWidget(time_lbl)
-                ob = QPushButton("출차"); ob.setObjectName("Primary"); ob.setFixedSize(50, 26)
+                ob = QPushButton("출차"); ob.setObjectName("Primary"); ob.setFixedSize(66, 34)
                 ob.clicked.connect(lambda _, pt=d["plate_text"]: self._dash_exit(pt))
                 rl.addWidget(ob)
                 self.dash_parked_vbox.addWidget(row)
@@ -1142,7 +1208,7 @@ class MainWindow(QMainWindow):
                 _ok_lbl = QLabel("경보 없음")
                 _ok_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 _ok_lbl.setStyleSheet(
-                    f"color: {C_GREEN}; font-size: 14px; font-weight: bold; "
+                    f"color: {C_GREEN}; font-size: 19px; font-weight: bold; "
                     "background: transparent; border: none;"
                 )
                 _ev_lo.addWidget(_ok_lbl)
@@ -1171,7 +1237,7 @@ class MainWindow(QMainWindow):
                     top_row.addWidget(warn_ic)
                     plate_lbl = QLabel(a.get("plate_text", a.get("msg", "")))
                     plate_lbl.setStyleSheet(
-                        "color: #7F1D1D; font-weight: bold; font-size: 13px; "
+                        "color: #7F1D1D; font-weight: bold; font-size: 18px; "
                         "background: transparent; border: none;"
                     )
                     top_row.addWidget(plate_lbl)
@@ -1182,7 +1248,7 @@ class MainWindow(QMainWindow):
                         f"{a.get('camera', '')}  |  {a.get('ts', '')}"
                     )
                     sub_lbl.setStyleSheet(
-                        "color: #9B1C1C; font-size: 11px; "
+                        "color: #9B1C1C; font-size: 16px; "
                         "background: transparent; border: none;"
                     )
                     il.addWidget(sub_lbl)
@@ -1194,6 +1260,41 @@ class MainWindow(QMainWindow):
         manual_exit(self.conn, plate_text)
         self.show_toast(f"{plate_text} 출차 완료")
         self.refresh_dashboard()
+
+    def check_overstay(self):
+        """미등록 차량이 기준 시간 이상 연속 주차 중이면 불법 주정차 의심으로
+        시각·사진과 함께 기록하고 경보 알림에 추가한다."""
+        try:
+            rows = query_overstay(self.conn, OVERSTAY_THRESHOLD_MIN)
+            new_found = False
+            for r in rows:
+                d = dict(r)
+                if has_overstay_log(self.conn, d["plate_text"], d["entry_time"]):
+                    continue
+                img_row = self.conn.execute(
+                    "SELECT image_path FROM plate_logs WHERE plate_text=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (d["plate_text"],)
+                ).fetchone()
+                img_path = img_row[0] if img_row and img_row[0] else ""
+                insert_overstay_log(
+                    self.conn, d["plate_text"], d.get("camera_id", ""),
+                    d["entry_time"], d["duration_min"], img_path
+                )
+                self.alert_list.insert(0, {
+                    "plate_text": d["plate_text"],
+                    "camera": d.get("camera_id", ""),
+                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "msg": f"불법 주정차 의심 ({d['duration_min']}분 경과)",
+                })
+                self.show_toast(
+                    f"불법 주정차 의심: {d['plate_text']} ({d['duration_min']}분 경과)"
+                )
+                new_found = True
+            if new_found:
+                self.refresh_dashboard()
+        except Exception:
+            import traceback; traceback.print_exc()
 
     def _on_camera_detected(self, result):
         try:
@@ -1241,7 +1342,7 @@ class MainWindow(QMainWindow):
 
         self.s_plate_tf = QLineEdit()
         self.s_plate_tf.setPlaceholderText("번호판 입력 (예: 12가3456)")
-        self.s_plate_tf.setFixedWidth(200)
+        self.s_plate_tf.setFixedWidth(220)
         self.s_plate_tf.returnPressed.connect(lambda: self.search_load("plate"))
 
         bp = QPushButton("조회"); bp.setObjectName("Primary")
@@ -1249,12 +1350,12 @@ class MainWindow(QMainWindow):
         bp.clicked.connect(lambda: self.search_load("plate"))
 
         self.s_date_tf = QLineEdit(datetime.now().strftime("%Y-%m-%d"))
-        self.s_date_tf.setFixedWidth(140)
+        self.s_date_tf.setFixedWidth(156)
         bd = QPushButton("날짜 조회"); bd.setObjectName("Primary")
         bd.setIcon(qta.icon("fa5s.calendar", color="white"))
         bd.clicked.connect(lambda: self.search_load("date"))
 
-        self.s_cam_combo = QComboBox(); self.s_cam_combo.setFixedWidth(120)
+        self.s_cam_combo = QComboBox(); self.s_cam_combo.setFixedWidth(136)
         self.s_cam_combo.addItem("전체")
         for c in get_all_cameras(self.conn):
             self.s_cam_combo.addItem(c["camera_id"])
@@ -1281,9 +1382,9 @@ class MainWindow(QMainWindow):
 
         # 열 헤더 행
         lo.addWidget(col_header_row(
-            ("", 14), ("번호판", 120), ("구분", 50), ("카메라", 80),
-            ("신뢰도", 48), ("인식 시각", None), ("입차", 95), ("출차", 95),
-            ("", 40), ("삭제", 60),
+            ("", 14), ("번호판", 136), ("구분", 84), ("카메라", 104),
+            ("신뢰도", 66), ("인식 시각", None), ("입차", 110), ("출차", 110),
+            ("", 84), ("삭제", 84),
         ))
 
         self.s_scroll, self.s_vbox = self._scroll_area()
@@ -1397,8 +1498,8 @@ class MainWindow(QMainWindow):
         lo.addWidget(form)
 
         wl_header = col_header_row(
-            ("번호판", 130), ("소유자", 100), ("차량 설명", 130),
-            ("전화번호", 120), ("메모", None), ("등록일", 90), ("", 54),
+            ("번호판", 148), ("소유자", 120), ("차량 설명", 150),
+            ("전화번호", 140), ("메모", None), ("등록일", 118), ("", 68),
         )
         self.wl_scroll, self.wl_vbox = self._scroll_area()
         lo.addWidget(self._bordered_list(wl_header, self.wl_scroll), 1)
@@ -1411,7 +1512,7 @@ class MainWindow(QMainWindow):
             row.setMinimumHeight(52)
             # objectName으로 한정 → 호버 테두리가 내부 box(컬러 바 등)에 안 번짐
             row.setStyleSheet(
-                "QFrame#WlRow { background-color: #FFFFFF; border: 1px solid transparent; border-radius: 10px; } "
+                "QFrame#WlRow { background-color: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 10px; } "
                 "QFrame#WlRow:hover { border: 1px solid #3B82F6; }"
             )
             row.setGraphicsEffect(create_shadow())
@@ -1419,39 +1520,43 @@ class MainWindow(QMainWindow):
 
             # 왼쪽 초록 액센트 바 (여백 + radius)
             accent = QFrame()
-            accent.setFixedWidth(5)
-            accent.setStyleSheet(f"background-color: {C_GREEN}; border-radius: 3px; border: none;")
+            accent.setObjectName("AccentBar")
+            accent.setFixedWidth(6)
+            accent.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+            accent.setStyleSheet(
+                f"QFrame#AccentBar {{ background-color: {C_GREEN}; border-radius: 3px; border: none; }}"
+            )
             rl.addWidget(accent)
 
             pl_lbl = QLabel(r["plate_text"])
-            pl_lbl.setStyleSheet(f"font-weight: bold; font-size: 14px; color: {C_TEXT}; border: none;")
-            pl_lbl.setFixedWidth(130)
+            pl_lbl.setStyleSheet(f"font-weight: bold; font-size: 19px; color: {C_TEXT}; border: none;")
+            pl_lbl.setFixedWidth(148)
             rl.addWidget(pl_lbl)
 
             for text, w in [
-                (r.get("owner_name", ""),   100),
-                (r.get("vehicle_desc", ""), 130),
-                (r.get("phone", ""),        120),
+                (r.get("owner_name", ""),   120),
+                (r.get("vehicle_desc", ""), 150),
+                (r.get("phone", ""),        140),
             ]:
                 lbl = QLabel(text)
-                lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 13px; border: none;")
+                lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 18px; border: none;")
                 lbl.setFixedWidth(w)
                 rl.addWidget(lbl)
 
             memo_lbl = QLabel(r.get("memo", ""))
-            memo_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 13px; border: none;")
+            memo_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 18px; border: none;")
             rl.addWidget(memo_lbl, 1)
 
             date_lbl = QLabel(r.get("registered_at", "")[:10])
-            date_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 12px; border: none;")
-            date_lbl.setFixedWidth(90)
+            date_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 17px; border: none;")
+            date_lbl.setFixedWidth(118)
             rl.addWidget(date_lbl)
 
             db = QPushButton("삭제")
-            db.setFixedSize(54, 28)
+            db.setFixedSize(68, 34)
             db.setStyleSheet(
                 f"background-color: {C_RED}; color: white; border-radius: 6px; "
-                f"font-weight: bold; font-size: 12px; border: none;"
+                f"font-weight: bold; font-size: 17px; border: none;"
             )
             db.clicked.connect(lambda _, pt=r["plate_text"]: self.wl_del(pt))
             rl.addWidget(db)
@@ -1502,8 +1607,8 @@ class MainWindow(QMainWindow):
         lo.addWidget(form)
 
         bl_header = col_header_row(
-            ("", 4), ("", 18), ("번호판", 130),
-            ("차단 사유", None), ("등록일", 90), ("", 80),
+            ("", 4), ("", 18), ("번호판", 148),
+            ("차단 사유", None), ("등록일", 118), ("", 104),
         )
         self.bl_scroll, self.bl_vbox = self._scroll_area()
         lo.addWidget(self._bordered_list(bl_header, self.bl_scroll), 1)
@@ -1517,7 +1622,7 @@ class MainWindow(QMainWindow):
             row.setMinimumHeight(52)
             # objectName으로 한정 → 호버 테두리가 내부 box(컬러 바 등)에 안 번짐
             row.setStyleSheet(
-                "QFrame#BlRow { background-color: #FEF2F2; border: 1px solid transparent; border-radius: 10px; } "
+                "QFrame#BlRow { background-color: #FEF2F2; border: 1px solid #FECACA; border-radius: 10px; } "
                 "QFrame#BlRow:hover { border: 1px solid #EF4444; }"
             )
             row.setGraphicsEffect(create_shadow())
@@ -1525,8 +1630,12 @@ class MainWindow(QMainWindow):
 
             # 빨간 왼쪽 강조 (여백 + radius)
             bar = QFrame()
-            bar.setFixedWidth(5)
-            bar.setStyleSheet(f"background-color: {C_RED}; border-radius: 3px; border: none;")
+            bar.setObjectName("AccentBar")
+            bar.setFixedWidth(6)
+            bar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+            bar.setStyleSheet(
+                f"QFrame#AccentBar {{ background-color: {C_RED}; border-radius: 3px; border: none; }}"
+            )
             rl.addWidget(bar)
 
             icon_lbl = QLabel()
@@ -1535,8 +1644,8 @@ class MainWindow(QMainWindow):
             rl.addWidget(icon_lbl)
 
             pl_lbl = QLabel(r["plate_text"])
-            pl_lbl.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {C_RED};")
-            pl_lbl.setFixedWidth(130)
+            pl_lbl.setStyleSheet(f"font-weight: bold; font-size: 18px; color: {C_RED};")
+            pl_lbl.setFixedWidth(148)
             pl_lbl.setContentsMargins(0, 8, 0, 8)
             rl.addWidget(pl_lbl)
 
@@ -1545,13 +1654,13 @@ class MainWindow(QMainWindow):
             rl.addWidget(reason_lbl, 1)
 
             date_lbl = QLabel(r.get("registered_at", "")[:10])
-            date_lbl.setObjectName("Muted"); date_lbl.setFixedWidth(90)
+            date_lbl.setObjectName("Muted"); date_lbl.setFixedWidth(118)
             rl.addWidget(date_lbl)
 
-            ub = QPushButton("차단 해제"); ub.setFixedSize(80, 28)
+            ub = QPushButton("차단 해제"); ub.setFixedSize(104, 34)
             ub.setStyleSheet(
                 f"QPushButton {{ background-color: {C_GREEN}; color: white; border: none; "
-                f"border-radius: 6px; font-weight: bold; font-size: 13px; }}"
+                f"border-radius: 6px; font-weight: bold; font-size: 18px; }}"
                 f"QPushButton:hover {{ background-color: #059669; }}"
             )
             ub.clicked.connect(lambda _, pt=r["plate_text"]: self.bl_del(pt))
@@ -1614,7 +1723,7 @@ class MainWindow(QMainWindow):
             pv.setMinimumHeight(300)
             pv.setStyleSheet(
                 f"background-color: #0F172A; color: {C_MUTED}; border: 1px solid {C_BORDER}; "
-                f"border-radius: 10px; font-size: 15px;"
+                f"border-radius: 10px; font-size: 19px;"
             )
             prev_split.addWidget(pv, 1)
             self.cam_previews.append(pv)
@@ -1630,7 +1739,7 @@ class MainWindow(QMainWindow):
         self.cam_crop_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         crop_lo.addWidget(self.cam_crop_lbl)
         self.cam_crop_text = QLabel("인식 대기 중...")
-        self.cam_crop_text.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {C_TEXT};")
+        self.cam_crop_text.setStyleSheet(f"font-size: 21px; font-weight: bold; color: {C_TEXT};")
         self.cam_crop_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         crop_lo.addWidget(self.cam_crop_text)
         self.cam_crop_conf = QLabel(""); self.cam_crop_conf.setObjectName("Muted")
@@ -1651,8 +1760,8 @@ class MainWindow(QMainWindow):
 
         # ── 하단: 카메라 목록 (넓게) ─────────────────────────────
         cam_header = col_header_row(
-            ("ID", 90), ("이름", 120), ("위치", 80), ("방향", 80),
-            ("소스", None), ("상태", 65), ("", 130),
+            ("ID", 100), ("이름", 120), ("위치", 80), ("방향", 80),
+            ("소스", None), ("상태", 80), ("", 188),
         )
         self.cam_scroll, self.cam_vbox = self._scroll_area()
         lo.addWidget(self._bordered_list(cam_header, self.cam_scroll), 2)
@@ -1682,12 +1791,12 @@ class MainWindow(QMainWindow):
             row.setObjectName("CamRow")
             if running:
                 row.setStyleSheet(
-                    "QFrame#CamRow { background-color: #F0FDF4; border: 1px solid transparent; border-radius: 10px; }"
+                    "QFrame#CamRow { background-color: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 10px; }"
                     "QFrame#CamRow:hover { border: 1px solid #10B981; }"
                 )
             else:
                 row.setStyleSheet(
-                    "QFrame#CamRow { background-color: #FFFFFF; border: 1px solid transparent; border-radius: 10px; }"
+                    "QFrame#CamRow { background-color: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 10px; }"
                     "QFrame#CamRow:hover { border: 1px solid #3B82F6; }"
                 )
             row.setGraphicsEffect(create_shadow())
@@ -1700,23 +1809,23 @@ class MainWindow(QMainWindow):
                 (cam.get("direction", ""), 80),
             ]:
                 lbl = QLabel(text)
-                lbl.setStyleSheet(f"color: {C_TEXT}; font-size: 14px; border: none; background: transparent;")
+                lbl.setStyleSheet(f"color: {C_TEXT}; font-size: 19px; border: none; background: transparent;")
                 lbl.setFixedWidth(w)
                 rl.addWidget(lbl)
 
             src_lbl = QLabel(cam.get("source") or "-")
-            src_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 13px; border: none; background: transparent;")
+            src_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 18px; border: none; background: transparent;")
             rl.addWidget(src_lbl, 1)
 
             # 상태 텍스트
             status_color_val = C_GREEN if running else C_RED
             status_text = "실행 중" if running else "중지"
             st_lbl = QLabel(status_text)
-            st_lbl.setFixedWidth(55)
+            st_lbl.setFixedWidth(74)
             st_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             st_lbl.setStyleSheet(
                 f"color: white; background-color: {status_color_val}; border-radius: 5px; "
-                f"font-size: 12px; font-weight: bold; border: none; padding: 2px 4px;"
+                f"font-size: 17px; font-weight: bold; border: none; padding: 2px 4px;"
             )
             rl.addWidget(st_lbl)
 
@@ -1725,17 +1834,17 @@ class MainWindow(QMainWindow):
             _tg_color = C_RED if running else C_GREEN
             toggle_btn.setStyleSheet(
                 f"QPushButton {{ background-color: {_tg_color}; color: white; border: none; "
-                f"border-radius: 6px; font-weight: bold; font-size: 13px; }}"
+                f"border-radius: 6px; font-weight: bold; font-size: 18px; }}"
                 f"QPushButton:hover {{ background-color: {'#DC2626' if running else '#059669'}; }}"
             )
-            toggle_btn.setFixedSize(60, 28)
+            toggle_btn.setFixedSize(84, 36)
             toggle_btn.clicked.connect(lambda _, c=cam: self.cam_toggle(c))
             rl.addWidget(toggle_btn)
 
-            del_btn = QPushButton("삭제"); del_btn.setFixedSize(54, 28)
+            del_btn = QPushButton("삭제"); del_btn.setFixedSize(84, 36)
             del_btn.setStyleSheet(
                 f"QPushButton {{ background-color: {C_MUTED}; color: white; border: none; "
-                f"border-radius: 6px; font-weight: bold; font-size: 13px; }}"
+                f"border-radius: 6px; font-weight: bold; font-size: 18px; }}"
                 f"QPushButton:hover {{ background-color: #475569; }}"
             )
             del_btn.clicked.connect(lambda _, c=cid: self.cam_del(c))
@@ -1837,11 +1946,13 @@ class MainWindow(QMainWindow):
         path_row = QHBoxLayout(); path_row.setSpacing(8)
         self.v_path = QLineEdit()
         self.v_path.setPlaceholderText(r"C:\Users\videos\parking.mp4")
+        # 전체 경로는 툴팁으로도 확인 가능
+        self.v_path.textChanged.connect(self.v_path.setToolTip)
         browse = QPushButton("찾아보기"); browse.setObjectName("Outline")
         browse.clicked.connect(self._browse_video)
-        self.v_cam = QComboBox(); self.v_cam.setFixedWidth(120)
+        self.v_cam = QComboBox(); self.v_cam.setFixedWidth(170)
         self._refresh_video_cam_combo()
-        self.v_dir = QComboBox(); self.v_dir.setFixedWidth(120)
+        self.v_dir = QComboBox(); self.v_dir.setFixedWidth(220)
         self.v_dir.addItems(["ENTRY (입차)", "EXIT (출차)", "BOTH (양방향)"])
         self.v_start = QPushButton("처리 시작"); self.v_start.setObjectName("Success")
         self.v_start.setIcon(qta.icon("fa5s.play", color="white"))
@@ -1891,7 +2002,7 @@ class MainWindow(QMainWindow):
         crop_lo.addWidget(self.crop_lbl)
 
         self.crop_text = QLabel("인식 대기 중...")
-        self.crop_text.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {C_TEXT};")
+        self.crop_text.setStyleSheet(f"font-size: 23px; font-weight: bold; color: {C_TEXT};")
         self.crop_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         crop_lo.addWidget(self.crop_text)
 
@@ -1901,7 +2012,7 @@ class MainWindow(QMainWindow):
         self.crop_type_badge = QLabel("")
         self.crop_type_badge.setStyleSheet(
             f"background-color: {C_ACCENT}; color: white; border-radius: 4px; "
-            f"padding: 2px 8px; font-size: 11px; font-weight: bold;"
+            f"padding: 2px 8px; font-size: 16px; font-weight: bold;"
         )
         self.crop_type_badge.setVisible(False)
         badge_row.addWidget(self.crop_conf_lbl); badge_row.addWidget(self.crop_type_badge)
@@ -1988,7 +2099,7 @@ class MainWindow(QMainWindow):
         self.crop_type_badge.setStyleSheet(
             f"background-color: {C_ACCENT if ptype == 'NEW' else '#b3b3b3'}; "
             f"color: white; border-radius: 4px; padding: 2px 8px; "
-            f"font-size: 11px; font-weight: bold;"
+            f"font-size: 16px; font-weight: bold;"
         )
         self.crop_type_badge.setVisible(True)
 
@@ -2029,7 +2140,7 @@ class MainWindow(QMainWindow):
             lo.setSpacing(16)
 
             title_lbl = QLabel("블랙리스트 차단 차량 인식!")
-            title_lbl.setStyleSheet("color: #F59E0B; font-size: 22px; font-weight: bold;")
+            title_lbl.setStyleSheet("color: #F59E0B; font-size: 23px; font-weight: bold;")
             title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lo.addWidget(title_lbl)
 
@@ -2041,14 +2152,14 @@ class MainWindow(QMainWindow):
             info_lbl = QLabel(
                 f"카메라: {data.get('camera', '')}     시각: {data.get('ts', '')}"
             )
-            info_lbl.setStyleSheet("color: #FCD34D; font-size: 15px;")
+            info_lbl.setStyleSheet("color: #FCD34D; font-size: 19px;")
             info_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lo.addWidget(info_lbl)
 
             ok_btn = QPushButton("확인")
             ok_btn.setFixedHeight(42)
             ok_btn.setStyleSheet(
-                "background-color: #EF4444; color: white; font-size: 16px; "
+                "background-color: #EF4444; color: white; font-size: 19px; "
                 "font-weight: bold; border-radius: 8px; border: none;"
             )
             ok_btn.clicked.connect(dlg.accept)
@@ -2102,7 +2213,7 @@ class MainWindow(QMainWindow):
             "투표(Voting): 여러 번호판을 여러 프레임에서 취합해 최다 득표 결과를 확정합니다\n"
             "Fuzzy 편집거리: 편집거리 이하의 유사 번호판은 같은 차량으로 통합. 0=정확히 일치만."
         )
-        info_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 14px;")
+        info_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 19px;")
         info_lbl.setWordWrap(True)
         bl.addWidget(info_lbl)
         lo.addWidget(banner)
@@ -2117,11 +2228,11 @@ class MainWindow(QMainWindow):
         gl = QHBoxLayout(gpu_card); gl.setContentsMargins(16, 14, 16, 14); gl.setSpacing(12)
         gpu_text_col = QVBoxLayout(); gpu_text_col.setSpacing(3)
         gpu_title = QLabel("GPU 가속 (PaddleOCR)")
-        gpu_title.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {C_TEXT};")
+        gpu_title.setStyleSheet(f"font-weight: bold; font-size: 18px; color: {C_TEXT};")
         gpu_desc  = QLabel("OCR 추론을 GPU로 실행. CPU 대비 5~10배 빠름.")
         gpu_desc.setObjectName("Muted")
         gpu_rec   = QLabel("권장: CUDA GPU 사용 가능하면 ON")
-        gpu_rec.setStyleSheet(f"color: {C_ACCENT}; font-size: 11px;")
+        gpu_rec.setStyleSheet(f"color: {C_ACCENT}; font-size: 16px;")
         gpu_text_col.addWidget(gpu_title); gpu_text_col.addWidget(gpu_desc); gpu_text_col.addWidget(gpu_rec)
         gl.addLayout(gpu_text_col, 1)
 
@@ -2136,7 +2247,7 @@ class MainWindow(QMainWindow):
             _gpu_status_color = C_MUTED
         self.gpu_status_lbl = QLabel(_gpu_status_text)
         self.gpu_status_lbl.setStyleSheet(
-            f"color: {_gpu_status_color}; font-size: 14px;"
+            f"color: {_gpu_status_color}; font-size: 19px;"
         )
         self.gpu_chk.stateChanged.connect(self._toggle_gpu)
         gpu_right = QVBoxLayout(); gpu_right.setAlignment(Qt.AlignmentFlag.AlignRight)
@@ -2180,7 +2291,7 @@ class MainWindow(QMainWindow):
         rb2 = QPushButton("기본값 복원"); rb2.setObjectName("Outline")
         rb2.clicked.connect(self.reset_settings)
         self.set_status_lbl = QLabel("")
-        self.set_status_lbl.setStyleSheet(f"color: {C_GREEN}; font-size: 14px;")
+        self.set_status_lbl.setStyleSheet(f"color: {C_GREEN}; font-size: 19px;")
         btn_row.addWidget(ab); btn_row.addWidget(rb2); btn_row.addWidget(self.set_status_lbl)
         btn_row.addStretch()
         lo.addLayout(btn_row)
@@ -2194,12 +2305,12 @@ class MainWindow(QMainWindow):
         card = QFrame(); card.setObjectName("Card")
         lo = QHBoxLayout(card); lo.setContentsMargins(16, 12, 16, 12); lo.setSpacing(16)
         text_col = QVBoxLayout(); text_col.setSpacing(3)
-        t = QLabel(title); t.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {C_TEXT};")
+        t = QLabel(title); t.setStyleSheet(f"font-weight: bold; font-size: 18px; color: {C_TEXT};")
         d = QLabel(desc);  d.setObjectName("Muted")
-        r = QLabel(f"권장: {recommend}"); r.setStyleSheet(f"color: {C_ACCENT}; font-size: 11px;")
+        r = QLabel(f"권장: {recommend}"); r.setStyleSheet(f"color: {C_ACCENT}; font-size: 16px;")
         text_col.addWidget(t); text_col.addWidget(d); text_col.addWidget(r)
         lo.addLayout(text_col, 1)
-        field = QLineEdit(value); field.setFixedWidth(130)
+        field = QLineEdit(value); field.setFixedWidth(146)
         lo.addWidget(field)
         return card, field
 
@@ -2207,7 +2318,7 @@ class MainWindow(QMainWindow):
         use_gpu = (state == Qt.CheckState.Checked.value)
         self.gpu_chk.setEnabled(False)
         self.gpu_status_lbl.setText("PaddleOCR 모델 재로딩 중..")
-        self.gpu_status_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 14px;")
+        self.gpu_status_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 19px;")
 
         def _reload():
             success = True
@@ -2222,12 +2333,12 @@ class MainWindow(QMainWindow):
                     pass
                 self.gpu_chk.setChecked(False)
                 self.gpu_status_lbl.setText("GPU 초기화 실패 → CPU로 전환")
-                self.gpu_status_lbl.setStyleSheet(f"color: {C_RED}; font-size: 14px;")
+                self.gpu_status_lbl.setStyleSheet(f"color: {C_RED}; font-size: 19px;")
             else:
                 actual = use_gpu and success
                 self.gpu_status_lbl.setText("GPU 사용 중" if actual else "CPU 사용 중")
                 self.gpu_status_lbl.setStyleSheet(
-                    f"color: {C_GREEN if actual else C_MUTED}; font-size: 14px;"
+                    f"color: {C_GREEN if actual else C_MUTED}; font-size: 19px;"
                 )
             self.gpu_chk.setEnabled(True)
 
@@ -2244,17 +2355,17 @@ class MainWindow(QMainWindow):
             pl.VOTE_IOU_TH     = max(0.1, min(0.9, float(vals[4])))
             pl.FUZZY_DIST      = max(0,   int(vals[5]))
             self.set_status_lbl.setText("설정 저장 완료 — 실행 중인 카메라에 즉시 반영됩니다")
-            self.set_status_lbl.setStyleSheet(f"color: {C_GREEN}; font-size: 14px;")
+            self.set_status_lbl.setStyleSheet(f"color: {C_GREEN}; font-size: 19px;")
         except ValueError:
             self.set_status_lbl.setText("숫자 형식 오류 — 숫자를 입력하세요")
-            self.set_status_lbl.setStyleSheet(f"color: {C_RED}; font-size: 14px;")
+            self.set_status_lbl.setStyleSheet(f"color: {C_RED}; font-size: 19px;")
 
     def reset_settings(self):
         defaults = ["7", "0.4", "30", "3", "0.3", "2"]
         for f, v in zip(self._set_fields, defaults):
             f.setText(v)
         self.set_status_lbl.setText("기본값으로 복원됨")
-        self.set_status_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 14px;")
+        self.set_status_lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 19px;")
 
     # ════════════════════════════════════════════════════════════
     # 통계
@@ -2267,7 +2378,7 @@ class MainWindow(QMainWindow):
         lo.addLayout(self._section_header("통계 차트"))
         date_lbl = QLabel("날짜:")
         self.stat_date = QLineEdit(datetime.now().strftime("%Y-%m-%d"))
-        self.stat_date.setFixedWidth(160)
+        self.stat_date.setFixedWidth(176)
         btn = QPushButton("조회"); btn.setObjectName("Primary")
         btn.setIcon(qta.icon("fa5s.chart-bar", color="white"))
         btn.clicked.connect(self.stats_refresh)
@@ -2284,12 +2395,12 @@ class MainWindow(QMainWindow):
         card = QFrame(); card.setObjectName("Card")
         cl = QVBoxLayout(card); cl.setContentsMargins(16, 14, 16, 14); cl.setSpacing(10)
         header = QHBoxLayout()
-        t = QLabel(title); t.setStyleSheet(f"font-weight: bold; font-size: 18px; color: {C_TEXT};")
+        t = QLabel(title); t.setStyleSheet(f"font-weight: bold; font-size: 21px; color: {C_TEXT};")
         header.addWidget(t); header.addStretch()
         if legend_items:
             for text, color in legend_items:
                 dot = QLabel("●")
-                dot.setStyleSheet(f"color: {color}; font-size: 14px;")
+                dot.setStyleSheet(f"color: {color}; font-size: 19px;")
                 lbl = QLabel(text); lbl.setObjectName("Muted")
                 header.addWidget(dot); header.addWidget(lbl)
         cl.addLayout(header)
@@ -2333,7 +2444,7 @@ class MainWindow(QMainWindow):
         # 번호판 유형 카드
         type_card = QFrame(); type_card.setObjectName("Card")
         tcl = QVBoxLayout(type_card); tcl.setContentsMargins(16, 14, 16, 14); tcl.setSpacing(12)
-        t = QLabel("번호판 유형 분포"); t.setStyleSheet(f"font-weight: bold; font-size: 18px; color: {C_TEXT};")
+        t = QLabel("번호판 유형 분포"); t.setStyleSheet(f"font-weight: bold; font-size: 21px; color: {C_TEXT};")
         tcl.addWidget(t)
         type_row = QHBoxLayout(); type_row.setSpacing(0)
         type_map = {r["plate_type"]: r["cnt"] for r in [dict(x) for x in type_rows]}
@@ -2364,8 +2475,8 @@ class MainWindow(QMainWindow):
 
         today = datetime.now().strftime("%Y-%m-%d")
         date_row = QHBoxLayout(); date_row.setSpacing(8)
-        self.ex_start = QLineEdit(today); self.ex_start.setFixedWidth(160)
-        self.ex_end   = QLineEdit(today); self.ex_end.setFixedWidth(160)
+        self.ex_start = QLineEdit(today); self.ex_start.setFixedWidth(176)
+        self.ex_end   = QLineEdit(today); self.ex_end.setFixedWidth(176)
         self.ex_preview_lbl = QLabel("")
         self.ex_preview_lbl.setObjectName("Muted")
         self.ex_start.textChanged.connect(self._ex_preview)
@@ -2376,6 +2487,9 @@ class MainWindow(QMainWindow):
         date_row.addWidget(self.ex_preview_lbl)
         date_row.addStretch()
         fl.addLayout(date_row)
+
+        self.ex_mask_chk = QCheckBox("개인정보 가림 처리 (번호판 끝 2자리·연락처 중간 자리 마스킹)")
+        fl.addWidget(self.ex_mask_chk)
 
         btn_row = QHBoxLayout(); btn_row.setSpacing(10)
         b1 = QPushButton("인식 기록 내보내기"); b1.setObjectName("Primary")
@@ -2426,28 +2540,29 @@ class MainWindow(QMainWindow):
     def do_export(self, mode):
         s = self.ex_start.text().strip()
         e = self.ex_end.text().strip()
+        mask = self.ex_mask_chk.isChecked()
         try:
             if mode == "log":
                 rows = query_by_date_range(self.conn, s, e)
                 if not rows:
                     self.ex_status_lbl.setText("해당 날짜에 데이터가 없습니다")
                     self.ex_status_lbl.setStyleSheet(f"color: {C_YELLOW};"); return
-                path = export_plate_logs(rows, s, e)
+                path = export_plate_logs(rows, s, e, mask_personal=mask)
             else:
                 rows = query_entry_exit_range(self.conn, s, e)
                 if not rows:
                     self.ex_status_lbl.setText("해당 날짜에 데이터가 없습니다")
                     self.ex_status_lbl.setStyleSheet(f"color: {C_YELLOW};"); return
-                path = export_entry_exit(rows, s, e)
+                path = export_entry_exit(rows, s, e, mask_personal=mask)
 
             self._last_export_dir = os.path.dirname(path)
             self.ex_status_lbl.setText(f"저장 완료: {os.path.basename(path)}  ({len(rows)}건)")
-            self.ex_status_lbl.setStyleSheet(f"color: {C_GREEN}; font-size: 14px;")
+            self.ex_status_lbl.setStyleSheet(f"color: {C_GREEN}; font-size: 19px;")
             self.ex_open_btn.setVisible(True)
             self.show_toast(f"파일 저장 완료 ({len(rows)}건)")
         except Exception as ex:
             self.ex_status_lbl.setText(f"오류: {ex}")
-            self.ex_status_lbl.setStyleSheet(f"color: {C_RED}; font-size: 14px;")
+            self.ex_status_lbl.setStyleSheet(f"color: {C_RED}; font-size: 19px;")
 
     def _open_export_folder(self):
         if self._last_export_dir and os.path.isdir(self._last_export_dir):
@@ -2468,12 +2583,12 @@ class MainWindow(QMainWindow):
 
         row1 = QHBoxLayout(); row1.setSpacing(8)
         row2 = QHBoxLayout(); row2.setSpacing(8)
-        self.f_free  = QLineEdit(str(FEE_CONFIG["free_min"]));  self.f_free.setFixedWidth(120)
-        self.f_base  = QLineEdit(str(FEE_CONFIG["base_fee"]));  self.f_base.setFixedWidth(120)
-        self.f_basem = QLineEdit(str(FEE_CONFIG["base_min"]));  self.f_basem.setFixedWidth(120)
-        self.f_unit  = QLineEdit(str(FEE_CONFIG["unit_fee"]));  self.f_unit.setFixedWidth(120)
-        self.f_unitm = QLineEdit(str(FEE_CONFIG["unit_min"]));  self.f_unitm.setFixedWidth(120)
-        self.f_max   = QLineEdit(str(FEE_CONFIG["daily_max"])); self.f_max.setFixedWidth(120)
+        self.f_free  = QLineEdit(str(FEE_CONFIG["free_min"]));  self.f_free.setFixedWidth(136)
+        self.f_base  = QLineEdit(str(FEE_CONFIG["base_fee"]));  self.f_base.setFixedWidth(136)
+        self.f_basem = QLineEdit(str(FEE_CONFIG["base_min"]));  self.f_basem.setFixedWidth(136)
+        self.f_unit  = QLineEdit(str(FEE_CONFIG["unit_fee"]));  self.f_unit.setFixedWidth(136)
+        self.f_unitm = QLineEdit(str(FEE_CONFIG["unit_min"]));  self.f_unitm.setFixedWidth(136)
+        self.f_max   = QLineEdit(str(FEE_CONFIG["daily_max"])); self.f_max.setFixedWidth(136)
 
         for label, field, parent_row in [
             ("무료 시간(분)", self.f_free,  row1),
@@ -2492,7 +2607,7 @@ class MainWindow(QMainWindow):
         save_btn.setIcon(qta.icon("fa5s.save", color="white"))
         save_btn.clicked.connect(self.save_fee_config)
         self.fee_cfg_status = QLabel("")
-        self.fee_cfg_status.setStyleSheet(f"color: {C_GREEN}; font-size: 14px;")
+        self.fee_cfg_status.setStyleSheet(f"color: {C_GREEN}; font-size: 19px;")
 
         cfg_lo.addLayout(row1); cfg_lo.addLayout(row2)
         save_row = QHBoxLayout()
@@ -2504,7 +2619,7 @@ class MainWindow(QMainWindow):
         search_card = QFrame(); search_card.setObjectName("Card")
         sc_lo = QHBoxLayout(search_card); sc_lo.setContentsMargins(16, 12, 16, 12); sc_lo.setSpacing(8)
         self.f_plate = QLineEdit(); self.f_plate.setPlaceholderText("번호판 입력 (비워두면 전체)")
-        self.f_plate.setFixedWidth(220)
+        self.f_plate.setFixedWidth(240)
         calc_btn = QPushButton("조회"); calc_btn.setObjectName("Success")
         calc_btn.setIcon(qta.icon("fa5s.calculator", color="white"))
         calc_btn.clicked.connect(self.calc_fee_ui)
@@ -2512,7 +2627,7 @@ class MainWindow(QMainWindow):
         lo.addWidget(search_card)
 
         fee_scroll_lbl = QLabel("현재 주차 중인 차량 요금")
-        fee_scroll_lbl.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {C_TEXT};")
+        fee_scroll_lbl.setStyleSheet(f"font-size: 19px; font-weight: bold; color: {C_TEXT};")
         lo.addWidget(fee_scroll_lbl)
         self.fee_scroll, self.fee_vbox = self._scroll_area()
         lo.addWidget(self.fee_scroll, 1)
@@ -2565,7 +2680,7 @@ class MainWindow(QMainWindow):
 
             left = QVBoxLayout(); left.setSpacing(4)
             pl_lbl = QLabel(plate_text)
-            pl_lbl.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {C_TEXT}; background: transparent; border: none;")
+            pl_lbl.setStyleSheet(f"font-size: 19px; font-weight: bold; color: {C_TEXT}; background: transparent; border: none;")
             owner_lbl = QLabel(p.get("owner_name") or ("등록 차량" if is_wl else "미등록"))
             owner_lbl.setStyleSheet(f"color: {C_MUTED}; background: transparent; border: none;")
             left.addWidget(pl_lbl); left.addWidget(owner_lbl)
@@ -2580,7 +2695,7 @@ class MainWindow(QMainWindow):
                 dur_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
                 right.addWidget(dur_lbl)
                 fee_lbl = QLabel("0원")
-                fee_lbl.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {C_GREEN}; background: transparent; border: none;")
+                fee_lbl.setStyleSheet(f"font-size: 23px; font-weight: bold; color: {C_GREEN}; background: transparent; border: none;")
                 fee_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
                 right.addWidget(fee_lbl)
                 right.addWidget(make_tag("등록 차량 무료", C_GREEN),
@@ -2593,7 +2708,7 @@ class MainWindow(QMainWindow):
                 dur_lbl.setStyleSheet(f"color: {C_MUTED}; background: transparent; border: none;")
                 dur_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
                 fee_lbl = QLabel(info["fee_str"])
-                fee_lbl.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {color}; background: transparent; border: none;")
+                fee_lbl.setStyleSheet(f"font-size: 23px; font-weight: bold; color: {color}; background: transparent; border: none;")
                 fee_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
                 right.addWidget(dur_lbl); right.addWidget(fee_lbl)
                 if info["is_free"]:
@@ -2621,11 +2736,18 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    font_path = os.path.join(os.path.dirname(__file__), "assets", "fonts", "MyFont.ttf")
-    if os.path.exists(font_path):
-        fid = QFontDatabase.addApplicationFont(font_path)
-        if fid != -1:
-            app.setFont(QFont(QFontDatabase.applicationFontFamilies(fid)[0], 10))
+    _font_dir = os.path.join(os.path.dirname(__file__), "assets", "fonts")
+    _family = None
+    # Regular/Bold만 사용 — Medium/SemiBold는 OTF 내부 family명이 "Pretendard
+    # Medium" 등으로 따로 등록돼 있어 Qt가 "Pretendard" 패밀리로 못 찾는 문제가 있음
+    for _weight_file in ("Pretendard-Regular.otf", "Pretendard-Bold.otf"):
+        _fp = os.path.join(_font_dir, _weight_file)
+        if os.path.exists(_fp):
+            _fid = QFontDatabase.addApplicationFont(_fp)
+            if _fid != -1 and _family is None:
+                _family = QFontDatabase.applicationFontFamilies(_fid)[0]
+    if _family:
+        app.setFont(QFont(_family, 10))
     window = MainWindow()
     window.showMaximized()
     sys.exit(app.exec())
