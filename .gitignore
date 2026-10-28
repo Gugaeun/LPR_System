@@ -31,3 +31,10 @@ sample_json.txt
 # ── 파이썬 캐시 ───────────────────────────────────────
 __pycache__/
 *.pyc
+
+# ── 작업용 파일 (PC에만 보관) ────────────────────────
+.claude/
+.vscode/
+HANDOFF*.md
+lpr_system/_crop_*.jpg
+lpr_system/_sample_frame*.jpg
